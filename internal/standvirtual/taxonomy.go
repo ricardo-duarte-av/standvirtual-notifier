@@ -18,11 +18,12 @@ type FilterValue struct {
 
 // Makes returns the list of car brands Standvirtual offers, with listing counts.
 func (c *Client) Makes(ctx context.Context) ([]FilterValue, error) {
-	body, err := c.getHTML(ctx, listingBaseURL)
-	if err != nil {
-		return nil, err
-	}
-	vals, err := filterStateValues(body, "filter_enum_make", "")
+	var vals []FilterValue
+	err := c.fetchParsed(ctx, listingBaseURL, func(body []byte) error {
+		var err error
+		vals, err = filterStateValues(body, "filter_enum_make", "")
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -34,11 +35,12 @@ func (c *Client) Makes(ctx context.Context) ([]FilterValue, error) {
 // slug must be a valid make (as returned by Makes); an unknown make yields an
 // empty list.
 func (c *Client) Models(ctx context.Context, make string) ([]FilterValue, error) {
-	body, err := c.getHTML(ctx, listingBaseURL+"/"+make)
-	if err != nil {
-		return nil, err
-	}
-	vals, err := filterStateValues(body, "filter_enum_model", make)
+	var vals []FilterValue
+	err := c.fetchParsed(ctx, listingBaseURL+"/"+make, func(body []byte) error {
+		var err error
+		vals, err = filterStateValues(body, "filter_enum_model", make)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +102,7 @@ func filterStateValues(html []byte, filterID, makeCond string) ([]FilterValue, e
 			return out, nil
 		}
 	}
-	return nil, fmt.Errorf("filter %q options not found on page", filterID)
+	return nil, transient(fmt.Errorf("filter %q options not found on page", filterID))
 }
 
 // matchesMake reports whether the state's make condition equals want. When want

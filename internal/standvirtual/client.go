@@ -3,8 +3,11 @@ package standvirtual
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -19,7 +22,14 @@ const (
 	// pageSize is how many organic results Standvirtual returns per page.
 	pageSize  = 32
 	userAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+	// maxAttempts is how many times a fetch-and-parse cycle is tried before
+	// giving up.
+	maxAttempts = 3
 )
+
+// baseBackoff is the wait before the second attempt, doubled for each further
+// one. A variable so tests can shorten it.
+var baseBackoff = 3 * time.Second
 
 // Client fetches and parses Standvirtual car listing pages.
 type Client struct {
@@ -70,15 +80,60 @@ func (c *Client) Search(ctx context.Context, p SearchParams, maxPages int) ([]Of
 
 // fetchSearch fetches one results page and returns the parsed advertSearch block.
 func (c *Client) fetchSearch(ctx context.Context, p SearchParams, page int) (*advertSearch, error) {
-	body, err := c.getHTML(ctx, buildURL(p, page))
-	if err != nil {
-		return nil, err
-	}
-	res, err := parseAdvertSearch(body)
+	var res *advertSearch
+	err := c.fetchParsed(ctx, buildURL(p, page), func(body []byte) error {
+		var err error
+		res, err = parseAdvertSearch(body)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// ErrTransient marks failures that are worth retrying: network hiccups, 5xx or
+// 429 responses, and pages served without the state we expect (Standvirtual
+// intermittently returns a placeholder or challenge page under load).
+var ErrTransient = errors.New("transient standvirtual failure")
+
+// transient tags err as retryable while keeping its message and wrapped errors.
+func transient(err error) error { return transientErr{err} }
+
+type transientErr struct{ err error }
+
+func (e transientErr) Error() string        { return e.err.Error() }
+func (e transientErr) Unwrap() error        { return e.err }
+func (e transientErr) Is(target error) bool { return target == ErrTransient }
+
+// fetchParsed fetches reqURL and hands the body to parse, retrying the whole
+// fetch-and-parse cycle with exponential backoff while the failure is transient
+// and ctx is alive. The last error is returned once the attempts run out.
+func (c *Client) fetchParsed(ctx context.Context, reqURL string, parse func([]byte) error) error {
+	var err error
+	for attempt := 1; ; attempt++ {
+		err = func() error {
+			body, ferr := c.getHTML(ctx, reqURL)
+			if ferr != nil {
+				return ferr
+			}
+			return parse(body)
+		}()
+		if err == nil || attempt == maxAttempts || !errors.Is(err, ErrTransient) {
+			return err
+		}
+
+		// Back off with jitter so retries do not line up across searches.
+		wait := baseBackoff << (attempt - 1)
+		wait += time.Duration(rand.Int63n(int64(wait / 2)))
+		log.Printf("standvirtual: %v; retrying in %s (attempt %d/%d)",
+			err, wait.Round(time.Millisecond), attempt+1, maxAttempts)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(wait):
+		}
+	}
 }
 
 // getHTML performs a GET with a browser UA and returns the response body.
@@ -92,13 +147,22 @@ func (c *Client) getHTML(ctx context.Context, reqURL string) ([]byte, error) {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("standvirtual request: %w", err)
+		// Timeouts, DNS and TLS failures are all worth another go.
+		return nil, transient(fmt.Errorf("standvirtual request: %w", err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("standvirtual returned HTTP %d", resp.StatusCode)
+		err := fmt.Errorf("standvirtual returned HTTP %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			return nil, transient(err)
+		}
+		return nil, err
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 12<<20)) // 12 MiB cap
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 12<<20)) // 12 MiB cap
+	if err != nil {
+		return nil, transient(fmt.Errorf("standvirtual body: %w", err))
+	}
+	return body, nil
 }
 
 // buildURL constructs a cars search URL for the given params and page.
@@ -198,7 +262,7 @@ func (n node) toOffer() Offer {
 func nextDataBlobs(html []byte) ([]json.RawMessage, error) {
 	m := nextDataRe.FindSubmatch(html)
 	if m == nil {
-		return nil, fmt.Errorf("__NEXT_DATA__ not found on page")
+		return nil, transient(fmt.Errorf("__NEXT_DATA__ not found on page"))
 	}
 
 	var nd struct {
@@ -241,7 +305,7 @@ func parseAdvertSearch(html []byte) (*advertSearch, error) {
 			return wrap.AdvertSearch, nil
 		}
 	}
-	return nil, fmt.Errorf("advertSearch not found in page state")
+	return nil, transient(fmt.Errorf("advertSearch not found in page state"))
 }
 
 // unwrapJSON normalises a urqlState "data" value: it may be a JSON object, or a

@@ -22,11 +22,13 @@ type Details struct {
 // FetchDetails loads an ad's page and returns its photo gallery and description.
 // Both come from props.pageProps.advert in the page's __NEXT_DATA__ payload.
 func (c *Client) FetchDetails(ctx context.Context, adURL string) (Details, error) {
-	body, err := c.getHTML(ctx, adURL)
-	if err != nil {
-		return Details{}, err
-	}
-	return extractDetails(body)
+	var d Details
+	err := c.fetchParsed(ctx, adURL, func(body []byte) error {
+		var err error
+		d, err = extractDetails(body)
+		return err
+	})
+	return d, err
 }
 
 // advertPage mirrors the ad-detail slice of a page's __NEXT_DATA__.
@@ -50,7 +52,7 @@ type advertPage struct {
 func extractDetails(body []byte) (Details, error) {
 	m := nextDataRe.FindSubmatch(body)
 	if m == nil {
-		return Details{}, fmt.Errorf("__NEXT_DATA__ not found on ad page")
+		return Details{}, transient(fmt.Errorf("__NEXT_DATA__ not found on ad page"))
 	}
 	var page advertPage
 	if err := json.Unmarshal(m[1], &page); err != nil {
