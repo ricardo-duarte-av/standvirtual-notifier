@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -33,36 +34,50 @@ type Poller struct {
 	client   *standvirtual.Client
 	notifier Notifier
 	interval time.Duration
+	jitter   float64 // fraction of interval the wait may deviate by, either way
 	maxPages int
 
 	mu    sync.Mutex
 	fails map[int64]int // consecutive transient failures per search ID
 }
 
-// New builds a Poller.
-func New(st *store.Store, client *standvirtual.Client, n Notifier, interval time.Duration, maxPages int) *Poller {
+// New builds a Poller. jitterPercent randomises each wait between cycles by up
+// to ±that percentage of interval; 0 polls on an exact interval.
+func New(st *store.Store, client *standvirtual.Client, n Notifier, interval time.Duration, jitterPercent, maxPages int) *Poller {
 	return &Poller{
 		store: st, client: client, notifier: n,
-		interval: interval, maxPages: maxPages,
-		fails: make(map[int64]int),
+		interval: interval, jitter: float64(jitterPercent) / 100,
+		maxPages: maxPages,
+		fails:    make(map[int64]int),
 	}
 }
 
-// Run polls all searches immediately, then on every interval tick until ctx is
-// cancelled.
+// Run polls all searches immediately, then again after every (jittered) wait
+// until ctx is cancelled.
 func (p *Poller) Run(ctx context.Context) {
-	p.pollAll(ctx)
-
-	ticker := time.NewTicker(p.interval)
-	defer ticker.Stop()
 	for {
+		p.pollAll(ctx)
+
+		wait := p.nextWait()
+		log.Printf("poller: next cycle in %s", wait.Round(time.Second))
+
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			p.pollAll(ctx)
+		case <-timer.C:
 		}
 	}
+}
+
+// nextWait returns the interval offset by a random amount within ±jitter.
+func (p *Poller) nextWait() time.Duration {
+	if p.jitter <= 0 {
+		return p.interval
+	}
+	spread := float64(p.interval) * p.jitter
+	return time.Duration(float64(p.interval) + (rand.Float64()*2-1)*spread)
 }
 
 func (p *Poller) pollAll(ctx context.Context) {
@@ -87,7 +102,7 @@ func (p *Poller) pollAll(ctx context.Context) {
 		}
 		p.pollOne(ctx, s)
 	}
-	log.Printf("poller: poll cycle done in %s, next in %s", time.Since(start).Round(time.Millisecond), p.interval)
+	log.Printf("poller: poll cycle done in %s", time.Since(start).Round(time.Millisecond))
 }
 
 // PollSearch runs a single poll for one search now. It is used to seed a search

@@ -39,7 +39,8 @@ func main() {
 	}
 
 	p := poller.New(st, standvirtual.NewClient(), bot,
-		time.Duration(cfg.Poll.IntervalSeconds)*time.Second, cfg.Poll.MaxPages)
+		time.Duration(cfg.Poll.IntervalSeconds)*time.Second,
+		*cfg.Poll.JitterPercent, cfg.Poll.MaxPages)
 	bot.SetSeeder(p)
 
 	// Cancel everything on SIGINT/SIGTERM.
@@ -48,7 +49,8 @@ func main() {
 
 	go p.Run(ctx)
 
-	log.Printf("standvirtual-notifier started (interval=%ds, db=%s)", cfg.Poll.IntervalSeconds, cfg.DBPath)
+	log.Printf("standvirtual-notifier started (interval=%ds ±%d%%, db=%s)",
+		cfg.Poll.IntervalSeconds, *cfg.Poll.JitterPercent, cfg.DBPath)
 	if err := bot.Run(ctx); err != nil && ctx.Err() == nil {
 		log.Fatalf("matrix sync: %v", err)
 	}

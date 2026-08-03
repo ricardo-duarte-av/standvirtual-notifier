@@ -5,5 +5,6 @@ matrix:
   room_id: "!abc:matrix.org"   # room to post notifications / accept commands
 poll:
   interval_seconds: 300        # global default poll cadence (minimum 30)
+  jitter_percent: 20           # randomise each wait by ±this % of the interval (0-50, 0 disables)
   max_pages: 10                # safety cap on pagination per search (32 ads/page)
 db_path: "./standvirtual.db"
